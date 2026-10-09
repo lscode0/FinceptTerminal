@@ -140,7 +140,10 @@ jobs:
           cp build/FinceptTerminal AppDir/usr/bin/
           chmod +x AppDir/usr/bin/FinceptTerminal
           cp -r resources AppDir/usr/bin/resources 2>/dev/null || true
-          bash .github/scripts/sync_scripts.sh scripts AppDir/usr/bin/scripts
+          # Skrypt lezy w <repo>/.github/scripts, a ten krok ma working-directory:
+          # fincept-qt - sciezka wzgledna ".github/scripts/..." siegla o katalog
+          # za daleko i konczy sie "No such file or directory" (exit 127).
+          bash "$GITHUB_WORKSPACE/.github/scripts/sync_scripts.sh" scripts AppDir/usr/bin/scripts
 
           QTBIN="$(dirname "$(which qmake6 || which qmake)")"
           echo "Qt bin: $QTBIN"
@@ -183,7 +186,7 @@ jobs:
             if [ ! -e "$f" ]; then echo "::error::brak $f - AppDir niekompletny"; exit 1; fi
           done
           echo "AppDir OK"
-          ls -la AppDir/usr/bin/ | head -20
+          ls -la AppDir/usr/bin/
           echo "--- brakujace zaleznosci (nie powinno byc ani jednej) ---"
           ldd AppDir/usr/bin/FinceptTerminal | grep "not found" || echo "brak - wszystko rozwiązane"
 
