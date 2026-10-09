@@ -125,32 +125,72 @@ jobs:
 
       # Weryfikacja bezposrednio przez sprawdzenie zawartosci bundle'a Qt,
       # zamiast uruchamiania binarki. Uruchomienie w jobie wymagaloby xvfb
-      # i dzialajacych sterownikow GPU; sprawdzenie obecności libQt6*.so
-      # dowodzi tego samego dla celu "czy build jest kompletny".
-      - name: Verify Qt runtime bundle
+      # Binarny z linku jest sam w sobie bezużyteczny - bez Qt runtime'owych
+      # bibliotek i pluginów odmówi startu. Upstream buduje AppImage przez
+      # linuxdeploy; tutaj wystarczy AppDir, bo i tak nie zostanie odpalony
+      # bez WSL + VT-x, a AppImage dodaje ~100 linii obslugi edge case'ow
+      # (stripowanie sterownikow SQL, bundled libssl/libcrypto jako para).
+      - name: Assemble AppDir (Qt runtime)
         working-directory: fincept-qt
         shell: bash
         run: |
           set -euo pipefail
-          n=$(find build -name "libQt6Core.so*" | wc -l)
-          if [ "$n" -lt 1 ]; then
-            echo "::error::libQt6Core.so not found next to binary - windeployqt/linuxdeployqt did not run"
-            exit 1
+          mkdir -p AppDir/usr/bin
+
+          cp build/FinceptTerminal AppDir/usr/bin/
+          chmod +x AppDir/usr/bin/FinceptTerminal
+          cp -r resources AppDir/usr/bin/resources 2>/dev/null || true
+          bash .github/scripts/sync_scripts.sh scripts AppDir/usr/bin/scripts
+
+          QTBIN="$(dirname "$(which qmake6 || which qmake)")"
+          echo "Qt bin: $QTBIN"
+
+          # rdzen Qt + wszystkie modulow wymaganych przez target_link_libraries
+          for so in Core Gui Widgets Network Sql Charts Concurrent PrintSupport; do
+            cp -a "$QTBIN"/libQt6${so}.so* AppDir/usr/bin/ 2>/dev/null || true
+          done
+
+          # WebSockets i Multimedia sa opcjonalne w CMake, ale modul krypto
+          # stoi na WebSockets, wiec dokladamy tez te dwa.
+          for so in WebSockets Multimedia MultimediaWidgets; do
+            cp -a "$QTBIN"/libQt6${so}.so* AppDir/usr/bin/ 2>/dev/null || true
+          done
+
+          # Platformowy plugin xcb - bez niego Qt nie ma jak otworzyc okna
+          mkdir -p AppDir/usr/bin/platforms
+          cp -a "$QTBIN"/../plugins/platforms/libqxcb.so AppDir/usr/bin/platforms/ 2>/dev/null || true
+
+          # Sterowniki SQL: SQLite ma, reszta odpada (jak w build-cpp.yml - plugin
+          # Mimer ciagnie libmimerapi.so, ktorego na runnerze nie ma i deploy pada).
+          mkdir -p AppDir/usr/bin/sqldrivers
+          cp -a "$QTBIN"/../plugins/sqldrivers/libqsqlite.so AppDir/usr/bin/sqldrivers/ 2>/dev/null || true
+
+          # Platforma + ikona + ikony
+          mkdir -p AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          printf '[Desktop Entry]\nName=Fincept Terminal\nExec=FinceptTerminal\nIcon=fincept-terminal\nType=Application\nCategories=Finance;\n' \
+            > AppDir/usr/share/applications/fincept-terminal.desktop
+          if [ -f resources/icons/app_icon_256.png ]; then
+            cp resources/icons/app_icon_256.png AppDir/usr/share/icons/hicolor/256x256/apps/fincept-terminal.png
+          else
+            python3 -c 'from PIL import Image; Image.new("RGBA",(256,256),(26,26,46,255)).save(__import__("sys").argv[1],"PNG")' \
+              AppDir/usr/share/icons/hicolor/256x256/apps/fincept-terminal.png
           fi
-          echo "Qt runtime OK ($n libQt6Core.so copies)"
-          ldd build/FinceptTerminal | grep -c "=>" | xargs echo "rozwiazanych zaleznosci:"
+
+          # Kontrola jakosciowa - glowna wczesniejsza wersja tego workflow
+          # padala wlasnie tutaj: sprawdzala libQt6Core.so, ktorego nikt
+          # jeszcze nie skopiowal, bo nie bylo kroku deploy.
+          for f in AppDir/usr/bin/libQt6Core.so.6 AppDir/usr/bin/libQt6Widgets.so.6 AppDir/usr/bin/platforms/libqxcb.so; do
+            if [ ! -e "$f" ]; then echo "::error::brak $f - AppDir niekompletny"; exit 1; fi
+          done
+          echo "AppDir OK"
+          ls -la AppDir/usr/bin/ | head -20
+          echo "--- brakujace zaleznosci (nie powinno byc ani jednej) ---"
+          ldd AppDir/usr/bin/FinceptTerminal | grep "not found" || echo "brak - wszystko rozwiązane"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: FinceptTerminal-Linux-x64-build
-          path: |
-            fincept-qt/build/FinceptTerminal
-            fincept-qt/build/*.so
-            fincept-qt/build/*.so.*
-            fincept-qt/build/platforms/
-            fincept-qt/build/resources/
-            fincept-qt/build/translations/
-            fincept-qt/build/sqldrivers/
+          path: fincept-qt/AppDir
           retention-days: 14
           if-no-files-found: error
