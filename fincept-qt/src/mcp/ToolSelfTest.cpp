@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -218,6 +219,7 @@ int run_tool_selftest() {
     QStringList blocking_slow;           // CRITICAL — slow tool that can't be backgrounded
     QHash<QString, QStringList> by_desc; // duplicate-description detection
     int job_eligible_count = 0;
+    bool auth_gate_failed = false; // set by the Part 5 auth-gate contract check
 
     static const QRegularExpression mutating_rx(
         QStringLiteral("(?:^|_)(delete|remove|cancel|close|clear|wipe|drop|reset|unregister)(?:_|$)"),
@@ -492,9 +494,123 @@ int run_tool_selftest() {
             .arg(bad_schema.size())
             .arg(thin_desc.size()));
 
+    // ── Part 5: auth gate contract ────────────────────────────────────────────
+    //
+    // The gate in AgentService.cpp is the ONE place in the tool system where a
+    // regression spends real money or leaks live credentials. Nothing else here
+    // exercises it: Part 1 audits static declarations, which is exactly the
+    // thing a refactor would silently drop.
+    //
+    // What this asserts, without installing any checker and without a GUI:
+    // McpProvider must REFUSE a call that declares >= AuthLevel::Verified, and
+    // must REFUSE a call_tool_or_defer for an ExplicitConfirm tool. Both are
+    // "fail closed" guarantees the maintainers documented by hand, and both are
+    // load-bearing: the 13 tools they protect are live_place_order,
+    // profile_get_api_key and the mcp-servers family (arbitrary local child
+    // process spawn).
+    {
+        out(QStringLiteral("\n[5] AUTH GATE CONTRACT — deny-by-default for Verified+ / ExplicitConfirm"));
+
+        auto& prov = McpProvider::instance();
+        QStringList gate_errors;
+
+        // Declarative floor: whatever a protected tool declares, the LEVEL must
+        // be ExplicitConfirm. `is_destructive` is deliberately NOT asserted —
+        // reading a secret is not destructive in this model, and
+        // ProfileTools.cpp states the reasoning explicitly: ExplicitConfirm is
+        // the level that fails closed with no checker installed, so
+        // profile_get_api_key sets that and leaves is_destructive false. An
+        // earlier version of this test asserted both and produced a false
+        // alarm on correct code.
+        //
+        // Group 1 — real money / live credentials / arbitrary process spawn.
+        static const char* kMustRefuse[] = {
+            "live_place_order", "live_smart_order",     "live_cancel_order",
+            "live_cancel_all_orders", "live_close_position", "live_close_all_positions",
+            "profile_get_api_key",
+            "install_mcp_server_from_marketplace", "add_mcp_server",
+            "remove_mcp_server", "start_mcp_server", "restart_mcp_server",
+            "call_external_mcp_tool",
+        };
+        // Group 2 — destructive but recoverable; ExplicitConfirm only so they
+        // ride the same gate until the confirmation modal lands.
+        static const char* kShouldConfirm[] = {
+            "apply_layout", "delete_layout", "apply_layout_template",
+            "restore_last_workspace", "delete_workspace_snapshot",
+            "restore_workspace_snapshot", "close_window",
+            "load_dashboard_layout", "apply_dashboard_template",
+            "clear_dashboard_layout",
+            "delete_agent_config", "delete_workflow", "agent_paper_execute_trade",
+            "delete_excel_sheet", "download_managed_file",
+        };
+
+        const auto audit = prov.audit_all_tools();
+
+        auto check_group = [&](const char* const* names, std::size_t count, const char* group,
+                               bool require_destructive) {
+            int checked = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                const QString name = QString::fromUtf8(names[i]);
+                auto it = std::find_if(audit.begin(), audit.end(),
+                                       [&](const McpProvider::ToolAuditInfo& t) { return t.name == name; });
+                if (it == audit.end()) {
+                    gate_errors << (name + QStringLiteral(" (not registered — the AgentService.cpp "
+                                                          "comment enumerating this group is stale)"));
+                    continue;
+                }
+                ++checked;
+                if (it->auth_required < AuthLevel::ExplicitConfirm) {
+                    gate_errors << (QStringLiteral("[") + QLatin1String(group) + QStringLiteral("] ") + name +
+                                    QStringLiteral(" does not require ExplicitConfirm — it would execute "
+                                                   "without a confirmation prompt"));
+                }
+                if (require_destructive && !it->is_destructive) {
+                    gate_errors << (QStringLiteral("[") + QLatin1String(group) + QStringLiteral("] ") + name +
+                                    QStringLiteral(" has is_destructive=false"));
+                }
+            }
+            out(QStringLiteral("    %1: checked %2 of %3 names")
+                    .arg(QString::fromUtf8(group))
+                    .arg(checked)
+                    .arg(static_cast<int>(count)));
+        };
+
+        check_group(kMustRefuse, std::size(kMustRefuse), "protected", /*require_destructive=*/false);
+        check_group(kShouldConfirm, std::size(kShouldConfirm), "recoverable", /*require_destructive=*/true);
+
+        // Live assertion on the refusal itself: a tool declared ExplicitConfirm
+        // must not execute when invoked. Uses whatever ExplicitConfirm tool the
+        // catalog actually has, so it keeps working if the names above rotate.
+        std::string explicit_tool;
+        for (const auto& t : audit) {
+            if (t.auth_required >= AuthLevel::ExplicitConfirm) {
+                explicit_tool = t.name.toStdString();
+                break;
+            }
+        }
+        if (explicit_tool.empty()) {
+            gate_errors << QStringLiteral("no tool in the catalogue declares ExplicitConfirm — "
+                                          "the confirmation path is untested and unwired");
+        } else {
+            const ToolResult r = prov.call_tool(QString::fromStdString(explicit_tool), QJsonObject{});
+            if (r.success) {
+                gate_errors << (QString::fromStdString(explicit_tool) +
+                                QStringLiteral(" EXECUTED despite requiring ExplicitConfirm — "
+                                               "the auth gate did not fail closed"));
+            } else {
+                out(QStringLiteral("    refusal verified live: %1 returned an error")
+                        .arg(QString::fromStdString(explicit_tool)));
+            }
+        }
+
+        report_list(QStringLiteral("auth gate contract failures"), gate_errors, true);
+        auth_gate_failed = !gate_errors.isEmpty();
+    }
+
     // ── Verdict ───────────────────────────────────────────────────────────────
     constexpr double kRecall5Target = 0.95;
-    const bool pass = no_handler.isEmpty() && bad_schema.isEmpty() && recall5 >= kRecall5Target;
+    const bool pass = no_handler.isEmpty() && bad_schema.isEmpty() && recall5 >= kRecall5Target &&
+                      !auth_gate_failed;
     out(QString(QStringLiteral("  VERDICT: %1  (recall@5 target %2)"))
             .arg(pass ? QStringLiteral("PASS ✓") : QStringLiteral("FAIL ✗"))
             .arg(kRecall5Target, 0, 'f', 2));
